@@ -236,6 +236,89 @@ function safeFileName(value) {
     return String(value || 'unknown').replace(/[^a-z0-9]/gi, '_');
 }
 
+const RENEWAL_CACHE_PATH = process.env.RENEWAL_CACHE_PATH || path.join(process.cwd(), '.renewal-cache.json');
+const MONTHS = {
+    january: 0, jan: 0,
+    february: 1, feb: 1,
+    march: 2, mar: 2,
+    april: 3, apr: 3,
+    may: 4,
+    june: 5, jun: 5,
+    july: 6, jul: 6,
+    august: 7, aug: 7,
+    september: 8, sep: 8,
+    october: 9, oct: 9,
+    november: 10, nov: 10,
+    december: 11, dec: 11
+};
+
+function getUserCacheKey(index) {
+    return `user_${index + 1}`;
+}
+
+function loadRenewalCache() {
+    try {
+        if (!fs.existsSync(RENEWAL_CACHE_PATH)) return {};
+        const parsed = JSON.parse(fs.readFileSync(RENEWAL_CACHE_PATH, 'utf8'));
+        return parsed && typeof parsed === 'object' ? parsed : {};
+    } catch (e) {
+        console.log(`[缓存] 读取续期缓存失败，将忽略: ${e.message}`);
+        return {};
+    }
+}
+
+function saveRenewalCache(cache) {
+    try {
+        fs.writeFileSync(RENEWAL_CACHE_PATH, `${JSON.stringify(cache, null, 2)}\n`);
+        console.log(`[缓存] 续期缓存已保存: ${RENEWAL_CACHE_PATH}`);
+    } catch (e) {
+        console.log(`[缓存] 保存续期缓存失败: ${e.message}`);
+    }
+}
+
+function parseRenewalDate(dateStr, now = new Date()) {
+    const match = String(dateStr || '').trim().match(/^(\d{1,2})\s+([A-Za-z]+)(?:\s+(\d{4}))?$/);
+    if (!match) return null;
+
+    const day = Number(match[1]);
+    const month = MONTHS[match[2].toLowerCase()];
+    if (!Number.isInteger(day) || day < 1 || day > 31 || month === undefined) return null;
+
+    let year = match[3] ? Number(match[3]) : now.getUTCFullYear();
+    let candidate = new Date(Date.UTC(year, month, day, 0, 0, 0));
+    const todayUtc = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 0, 0, 0));
+
+    // 站点只返回 "11 June" 这种无年份日期；如果已经是过去日期，按下一年处理。
+    if (!match[3] && candidate < todayUtc) {
+        year += 1;
+        candidate = new Date(Date.UTC(year, month, day, 0, 0, 0));
+    }
+
+    if (Number.isNaN(candidate.getTime())) return null;
+    return candidate.toISOString().slice(0, 10);
+}
+
+const MAX_RENEWAL_SKIP_DAYS = Number(process.env.MAX_RENEWAL_SKIP_DAYS || 7);
+
+function getDaysUntil(dateIso, now = new Date()) {
+    const today = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 0, 0, 0));
+    const target = new Date(`${dateIso}T00:00:00.000Z`);
+    if (Number.isNaN(target.getTime())) return null;
+    return Math.ceil((target - today) / 86400000);
+}
+
+function shouldSkipUntilRenewalDate(cacheEntry, now = new Date()) {
+    if (!cacheEntry || !cacheEntry.nextRenewalDate) return false;
+    const daysUntil = getDaysUntil(cacheEntry.nextRenewalDate, now);
+    if (daysUntil === null) return false;
+    if (daysUntil <= 0) return false;
+    if (daysUntil > MAX_RENEWAL_SKIP_DAYS) {
+        console.log(`[缓存] 缓存日期 ${cacheEntry.nextRenewalDate} 距今 ${daysUntil} 天，超过上限 ${MAX_RENEWAL_SKIP_DAYS} 天，将忽略并按每日检查执行。`);
+        return false;
+    }
+    return true;
+}
+
 async function saveScreenshot(page, fileName) {
     const photoDir = ensureScreenshotDir();
     const screenshotPath = path.join(photoDir, fileName);
@@ -417,6 +500,7 @@ async function clickVisibleCaptchaCheckbox(page, modal) {
     let page = context.pages().length > 0 ? context.pages()[0] : await context.newPage();
     page.setDefaultTimeout(60000);
     let hasFailure = false;
+    const renewalCache = loadRenewalCache();
 
     if (PROXY_CONFIG && PROXY_CONFIG.username) {
         console.log('[代理] 正在设置认证...');
@@ -434,7 +518,15 @@ async function clickVisibleCaptchaCheckbox(page, modal) {
     for (let i = 0; i < users.length; i++) {
         const user = users[i];
         const safeUsername = safeFileName(user.username);
+        const cacheKey = getUserCacheKey(i);
+        const cacheEntry = renewalCache[cacheKey];
         console.log(`\n=== 正在处理用户 ${i + 1}/${users.length} ===`); // 隐去具体邮箱 logging
+
+        if (shouldSkipUntilRenewalDate(cacheEntry)) {
+            console.log(`[缓存] 当前未到站点返回的下次可续期日期 ${cacheEntry.nextRenewalDate}，跳过本次运行。`);
+            await sendTelegramMessage(`⏳ *续期暂缓*\n用户: ${user.username}\n原因: 未到站点返回的下次可续期日期\n下次可用: ${cacheEntry.nextRenewalDate}`);
+            continue;
+        }
 
         try {
             if (page.isClosed()) {
@@ -633,12 +725,25 @@ async function clickVisibleCaptchaCheckbox(page, modal) {
                                     const text = await notTimeLoc.innerText();
                                     const match = text.match(/as of\s+(.*?)\s+\(/);
                                     let dateStr = match ? match[1] : 'Unknown Date';
-                                    console.log(`   >> ⏳ 暂无法续期。下次可用时间: ${dateStr}`);
+                                    const nextRenewalDate = parseRenewalDate(dateStr);
+                                    console.log(`   >> ⏳ 暂无法续期。下次可用时间: ${dateStr}${nextRenewalDate ? ` (${nextRenewalDate})` : ''}`);
+
+                                    if (nextRenewalDate) {
+                                        renewalCache[cacheKey] = {
+                                            nextRenewalDate,
+                                            rawDate: dateStr,
+                                            updatedAt: new Date().toISOString()
+                                        };
+                                        saveRenewalCache(renewalCache);
+                                    } else {
+                                        delete renewalCache[cacheKey];
+                                        saveRenewalCache(renewalCache);
+                                    }
 
                                     // 截图证明
                                     const skipShotPath = await saveScreenshot(page, `${safeUsername}_skip.png`);
 
-                                    await sendTelegramMessage(`⏳ *暂无法续期 (跳过)*\n用户: ${user.username}\n原因: 还没到时间\n下次可用: ${dateStr}`, skipShotPath);
+                                    await sendTelegramMessage(`⏳ *暂无法续期 (跳过)*\n用户: ${user.username}\n原因: 还没到时间\n下次可用: ${nextRenewalDate || dateStr}`, skipShotPath);
 
                                     renewSuccess = true; // Mark as done to stop retries
                                     try {
